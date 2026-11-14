@@ -4619,6 +4619,27 @@ export const MISSING_SERVER_METADATA = 'OAUTH_MISSING_SERVER_METADATA'
  * @group Error Codes
  */
 export const INVALID_SERVER_METADATA = 'OAUTH_INVALID_SERVER_METADATA'
+/**
+ * Error code for a replayed DPoP Proof JWT.
+ *
+ * Assigned to {@link OperationProcessingError.code} when a {@link DPoPReplayStore DPoP replay store}
+ * reports that a DPoP Proof JWT's `jti` (JWT ID) claim value has already been consumed.
+ *
+ * @group Error Codes
+ *
+ * @see [RFC 9449 - OAuth 2.0 Demonstrating Proof-of-Possession at the Application Layer (DPoP)](https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1)
+ */
+export const DPOP_PROOF_REPLAY = 'OAUTH_DPOP_PROOF_REPLAY'
+/**
+ * Error code for a {@link DPoPReplayStore DPoP replay store} failure.
+ *
+ * Assigned to {@link OperationProcessingError.code} when the replay store rejects while atomically
+ * consuming a DPoP Proof JWT's `jti` (JWT ID) claim value. The store rejection is available on the
+ * {@link OperationProcessingError.cause `cause`} property.
+ *
+ * @group Error Codes
+ */
+export const DPOP_REPLAY_STORE_ERROR = 'OAUTH_DPOP_REPLAY_STORE_ERROR'
 
 function checkJwtType(expected: string, result: Awaited<ReturnType<typeof validateJwt>>) {
   if (typeof result.header.typ !== 'string' || normalizeTyp(result.header.typ) !== expected) {
@@ -6310,6 +6331,18 @@ export interface ValidateJWTAccessTokenOptions extends HttpRequestOptions<'GET'>
   requireDPoP?: boolean
 
   /**
+   * Replay store used to atomically consume (and therefore prevent the replay of) DPoP Proof JWT
+   * {@link https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.7 `jti`} claim values.
+   *
+   * The replay store is only consulted after the DPoP Proof JWT's signature, timestamps, and `htm`,
+   * `htu`, and `ath` claims, as well as the JWT Access Token itself, have all been validated. When
+   * not provided, no replay detection is performed.
+   *
+   * @see {@link DPoPReplayStore}
+   */
+  dpopReplayStore?: DPoPReplayStore
+
+  /**
    * See {@link clockSkew}.
    */
   [clockSkew]?: number
@@ -6326,6 +6359,42 @@ export interface ValidateJWTAccessTokenOptions extends HttpRequestOptions<'GET'>
   signingAlgorithms?: string[]
 }
 
+/**
+ * A replay store for atomically consuming DPoP Proof JWT
+ * {@link https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1.7 `jti`} (JWT ID) claim values so
+ * that the same DPoP Proof JWT cannot be replayed, including by concurrent requests.
+ *
+ * Implementations MUST ensure {@link DPoPReplayStore.consume `consume`} is atomic, i.e. only one
+ * concurrent invocation with a given `jti` value resolves to `true`; any subsequent invocation with
+ * the same value resolves to `false`. A proof `jti` MUST be retained for at least as long as the
+ * Proof JWT's {@link https://www.rfc-editor.org/rfc/rfc9449.html#name-proof-payload `iat`} (issued
+ * at) claim could still be accepted, which is 300 seconds per
+ * {@link https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1 RFC 9449}.
+ *
+ * A rejected {@link DPoPReplayStore.consume `consume`} call signals a storage failure and is
+ * distinguishable from a detected replay, which resolves to `false`.
+ *
+ * @group DPoP
+ *
+ * @see [RFC 9449 - OAuth 2.0 Demonstrating Proof-of-Possession at the Application Layer (DPoP)](https://www.rfc-editor.org/rfc/rfc9449.html#name-replay-prevention)
+ */
+export interface DPoPReplayStore {
+  /**
+   * Atomically consumes a DPoP Proof JWT's `jti` claim value.
+   *
+   * Resolves to `true` when the value has not been consumed before and was successfully stored, and
+   * to `false` when the value was already consumed, meaning the DPoP Proof JWT is being replayed.
+   *
+   * Rejects (rather than resolving to `false`) when the value could not be stored due to a storage
+   * failure. The rejection reason is surfaced as the {@link OperationProcessingError.cause `cause`}
+   * of an {@link OperationProcessingError} with {@link DPOP_REPLAY_STORE_ERROR} as its
+   * {@link OperationProcessingError.code `code`}.
+   *
+   * @param jti The validated DPoP Proof JWT `jti` claim value to consume.
+   */
+  consume(jti: string): Promise<boolean>
+}
+
 function normalizeHtu(htu: string) {
   const url = new URL(htu)
   url.search = ''
@@ -6339,7 +6408,7 @@ async function validateDPoP(
   accessTokenClaims: JWTPayload,
   options?: Pick<
     ValidateJWTAccessTokenOptions,
-    typeof clockSkew | typeof clockTolerance | 'signingAlgorithms'
+    typeof clockSkew | typeof clockTolerance | 'signingAlgorithms' | 'dpopReplayStore'
   >,
 ) {
   const headerValue = request.headers.get('dpop')
@@ -6451,6 +6520,27 @@ async function validateDPoP(
     })
   }
   await validateJwsSignature(protectedHeader, payload, key, signature)
+
+  const replayStore = options?.dpopReplayStore
+  if (replayStore !== undefined) {
+    let consumed: boolean
+    try {
+      consumed = await replayStore.consume(proof.claims.jti!)
+    } catch (cause) {
+      throw OPE(
+        'DPoP replay store failed while consuming the DPoP Proof jti',
+        DPOP_REPLAY_STORE_ERROR,
+        cause,
+      )
+    }
+
+    if (consumed === false) {
+      throw OPE('DPoP Proof jti has already been used', DPOP_PROOF_REPLAY, {
+        claims: proof.claims,
+        claim: 'jti',
+      })
+    }
+  }
 }
 
 /**
@@ -6470,6 +6560,12 @@ async function validateDPoP(
  *
  * This does NOT validate the DPoP Proof JWT nonce. If your server indicates RS-provided nonces to
  * clients you would check these after this function's execution.
+ *
+ * This does NOT detect the replay of DPoP Proof JWTs on its own. Provide a
+ * {@link DPoPReplayStore replay store} through the
+ * {@link ValidateJWTAccessTokenOptions.dpopReplayStore `dpopReplayStore`} option to atomically
+ * consume each validated DPoP Proof JWT's `jti` claim value and reject replayed proofs, including
+ * across concurrent requests.
  *
  * This does NOT validate authorization claims such as `scope` either, you would do so after this
  * function's execution.
@@ -6496,6 +6592,19 @@ export async function validateJwtAccessToken(
   }
 
   assertString(expectedAudience, '"expectedAudience"')
+
+  if (
+    options?.dpopReplayStore !== undefined &&
+    (typeof options.dpopReplayStore !== 'object' ||
+      options.dpopReplayStore === null ||
+      Array.isArray(options.dpopReplayStore) ||
+      typeof options.dpopReplayStore.consume !== 'function')
+  ) {
+    throw CodedTypeError(
+      '"options.dpopReplayStore" must implement a "consume" method',
+      ERR_INVALID_ARG_VALUE,
+    )
+  }
 
   const authorization = request.headers.get('authorization')
   if (authorization === null) {
