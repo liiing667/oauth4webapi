@@ -2438,7 +2438,7 @@ class DPoPHandler implements DPoPHandle {
     this.#clockSkew = getClockSkew(client)
     this.#privateKey = keyPair.privateKey
     this.#publicKey = keyPair.publicKey
-    branded.add(this)
+    branded.set(this, undefined)
   }
 
   #get(key: string) {
@@ -3982,9 +3982,19 @@ function validateIssuer(as: AuthorizationServer, result: Awaited<ReturnType<type
   return result
 }
 
-const branded = new WeakSet<URLSearchParams | DPoPHandle>()
-function brand(searchParams: URLSearchParams) {
-  branded.add(searchParams)
+/**
+ * Records the authorization server issuer and client_id an authorization response was validated
+ * for so that {@link authorizationCodeGrantRequest} can verify the same "as" and "client" are used
+ * when exchanging the authorization code.
+ */
+interface CallbackBinding {
+  iss: string
+  client_id: string
+}
+
+const branded = new WeakMap<URLSearchParams | DPoPHandle, CallbackBinding | undefined>()
+function brand(searchParams: URLSearchParams, as: AuthorizationServer, client: Client) {
+  branded.set(searchParams, { iss: as.issuer, client_id: client.client_id })
   return searchParams
 }
 
@@ -4015,7 +4025,9 @@ export const nopkce: unique symbol = Symbol()
  * @param client Client Metadata.
  * @param clientAuthentication Client Authentication Method.
  * @param callbackParameters Parameters obtained from the callback to redirect_uri, this is returned
- *   from {@link validateAuthResponse}, or {@link validateJwtAuthResponse}.
+ *   from {@link validateAuthResponse}, or {@link validateJwtAuthResponse}. The `as` and `client`
+ *   arguments must be the same ones the authorization response was validated for, otherwise the
+ *   request is rejected.
  * @param redirectUri `redirect_uri` value used in the authorization request.
  * @param codeVerifier PKCE `code_verifier` to send to the token endpoint.
  *
@@ -4042,11 +4054,26 @@ export async function authorizationCodeGrantRequest(
   assertAs(as)
   assertClient(client)
 
-  if (!branded.has(callbackParameters)) {
+  const binding = branded.get(callbackParameters)
+  if (binding === undefined) {
     throw CodedTypeError(
       '"callbackParameters" must be an instance of URLSearchParams obtained from "validateAuthResponse()", or "validateJwtAuthResponse()',
       ERR_INVALID_ARG_VALUE,
     )
+  }
+
+  if (binding.iss !== as.issuer) {
+    throw OPE('"callbackParameters" were validated for a different issuer', undefined, {
+      expected: binding.iss,
+      received: as.issuer,
+    })
+  }
+
+  if (binding.client_id !== client.client_id) {
+    throw OPE('"callbackParameters" were validated for a different client', undefined, {
+      expected: binding.client_id,
+      received: client.client_id,
+    })
   }
 
   assertString(redirectUri, '"redirectUri"')
@@ -5384,7 +5411,9 @@ async function validateJwt(
  * @param expectedState Expected `state` parameter value. Default is {@link expectNoState}.
  *
  * @returns Validated Authorization Response parameters. Authorization Error Responses are rejected
- *   using {@link AuthorizationResponseError}.
+ *   using {@link AuthorizationResponseError}. The returned parameters are bound to the `as` and
+ *   `client` arguments and {@link authorizationCodeGrantRequest} rejects them when used with a
+ *   different issuer or client.
  *
  * @group Authorization Code Grant
  * @group Authorization Code Grant w/ OpenID Connect (OIDC)
@@ -5877,7 +5906,9 @@ export const expectNoState: unique symbol = Symbol()
  * @param expectedState Expected `state` parameter value. Default is {@link expectNoState}.
  *
  * @returns Validated Authorization Response parameters. Authorization Error Responses throw
- *   {@link AuthorizationResponseError}.
+ *   {@link AuthorizationResponseError}. The returned parameters are bound to the `as` and `client`
+ *   arguments and {@link authorizationCodeGrantRequest} rejects them when used with a different
+ *   issuer or client.
  *
  * @group Authorization Code Grant
  * @group Authorization Code Grant w/ OpenID Connect (OIDC)
@@ -5967,7 +5998,7 @@ export function validateAuthResponse(
     throw new UnsupportedOperationError('implicit and hybrid flows are not supported')
   }
 
-  return brand(new URLSearchParams(parameters))
+  return brand(new URLSearchParams(parameters), as, client)
 }
 
 function algToSubtle(alg: string): RsaHashedImportParams | EcKeyImportParams | AlgorithmIdentifier {

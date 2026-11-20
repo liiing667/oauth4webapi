@@ -27,8 +27,8 @@ const tClient: lib.Client = { ...client, client_secret: 'foo' }
 
 function cb(params: string) {
   const callbackParameters = lib.validateAuthResponse(
-    { issuer: 'foo' },
-    { client_id: 'foo' },
+    issuer,
+    client,
     new URLSearchParams(),
     lib.expectNoState,
   )
@@ -113,6 +113,59 @@ test('authorizationCodeGrantRequest()', async () => {
           params.get('redirect_uri') === 'redirect_uri'
         )
       },
+    })
+    .reply(200, { access_token: 'token', token_type: 'Bearer' })
+
+  await assert.doesNotReject(
+    lib.authorizationCodeGrantRequest(
+      tIssuer,
+      tClient,
+      lib.None(),
+      cb('code=authorization_code'),
+      'redirect_uri',
+      'verifier',
+    ),
+  )
+})
+
+test('authorizationCodeGrantRequest() callback issuer/client binding', async () => {
+  await assert.rejects(
+    lib.authorizationCodeGrantRequest(
+      { issuer: 'https://other-op.example.com' },
+      tClient,
+      lib.None(),
+      cb('code=authorization_code'),
+      'redirect_uri',
+      'verifier',
+    ),
+    {
+      message: '"callbackParameters" were validated for a different issuer',
+    },
+  )
+
+  await assert.rejects(
+    lib.authorizationCodeGrantRequest(
+      issuer,
+      { client_id: 'other-client' },
+      lib.None(),
+      cb('code=authorization_code'),
+      'redirect_uri',
+      'verifier',
+    ),
+    {
+      message: '"callbackParameters" were validated for a different client',
+    },
+  )
+
+  const tIssuer: lib.AuthorizationServer = {
+    ...issuer,
+    token_endpoint: endpoint('token-binding'),
+  }
+
+  context
+    .intercept({
+      path: '/token-binding',
+      method: 'POST',
     })
     .reply(200, { access_token: 'token', token_type: 'Bearer' })
 

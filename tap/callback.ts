@@ -53,6 +53,58 @@ export default (QUnit: QUnit) => {
     )
   })
 
+  test('authorizationCodeGrantRequest() callback binding', async (t) => {
+    const stateless = lib.validateAuthResponse(
+      issuer,
+      client,
+      new URLSearchParams('code=foo'),
+      lib.expectNoState,
+    )
+    const skipped = lib.validateAuthResponse(
+      issuer,
+      client,
+      new URLSearchParams('code=foo&state=foo'),
+      lib.skipStateCheck,
+    )
+
+    for (const params of [stateless, skipped]) {
+      await t.rejects(
+        lib.authorizationCodeGrantRequest(
+          { issuer: 'https://other-op.example.com' },
+          client,
+          lib.None(),
+          params,
+          'redirect_uri',
+          'verifier',
+        ),
+        /"callbackParameters" were validated for a different issuer/,
+      )
+      await t.rejects(
+        lib.authorizationCodeGrantRequest(
+          issuer,
+          { client_id: 'other-client' },
+          lib.None(),
+          params,
+          'redirect_uri',
+          'verifier',
+        ),
+        /"callbackParameters" were validated for a different client/,
+      )
+      await t.rejects(
+        lib.authorizationCodeGrantRequest(
+          issuer,
+          client,
+          lib.None(),
+          params,
+          'redirect_uri',
+          'verifier',
+        ),
+        /"as.token_endpoint"|token_endpoint/,
+        'same issuer and client pass the binding check',
+      )
+    }
+  })
+
   test('validateAuthResponse() error conditions', (t) => {
     t.throws(
       () => lib.validateAuthResponse(issuer, client, null as any, lib.expectNoState),
