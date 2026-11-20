@@ -3939,16 +3939,14 @@ function validateOptionalAudience(
   return result
 }
 
-function validateAudience(expected: string, result: Awaited<ReturnType<typeof validateJwt>>) {
-  if (Array.isArray(result.claims.aud)) {
-    if (!result.claims.aud.includes(expected)) {
-      throw OPE('unexpected JWT "aud" (audience) claim value', JWT_CLAIM_COMPARISON, {
-        expected,
-        claims: result.claims,
-        claim: 'aud',
-      })
-    }
-  } else if (result.claims.aud !== expected) {
+function validateAudience(
+  expected: string | string[],
+  result: Awaited<ReturnType<typeof validateJwt>>,
+) {
+  const expectedAudiences = Array.isArray(expected) ? expected : [expected]
+  const claimAudiences = Array.isArray(result.claims.aud) ? result.claims.aud : [result.claims.aud]
+
+  if (!expectedAudiences.some((audience) => claimAudiences.includes(audience))) {
     throw OPE('unexpected JWT "aud" (audience) claim value', JWT_CLAIM_COMPARISON, {
       expected,
       claims: result.claims,
@@ -6475,7 +6473,9 @@ async function validateDPoP(
  * function's execution.
  *
  * @param as Authorization Server to accept JWT Access Tokens from.
- * @param expectedAudience Audience identifier the resource server expects for itself.
+ * @param expectedAudience Audience identifier the resource server expects for itself. When an array
+ *   is provided (e.g. when the resource server is reachable under multiple resource identifiers)
+ *   the JWT Access Token's `aud` claim must contain at least one of the values.
  *
  * @group JWT Access Tokens
  *
@@ -6486,7 +6486,7 @@ async function validateDPoP(
 export async function validateJwtAccessToken(
   as: AuthorizationServer,
   request: Request,
-  expectedAudience: string,
+  expectedAudience: string | string[],
   options?: ValidateJWTAccessTokenOptions,
 ): Promise<JWTAccessTokenClaims> {
   assertAs(as)
@@ -6495,7 +6495,14 @@ export async function validateJwtAccessToken(
     throw CodedTypeError('"request" must be an instance of Request', ERR_INVALID_ARG_TYPE)
   }
 
-  assertString(expectedAudience, '"expectedAudience"')
+  if (Array.isArray(expectedAudience)) {
+    if (expectedAudience.length === 0) {
+      throw CodedTypeError('"expectedAudience" must not be an empty array', ERR_INVALID_ARG_VALUE)
+    }
+    expectedAudience.forEach((audience, i) => assertString(audience, `"expectedAudience[${i}]"`))
+  } else {
+    assertString(expectedAudience, '"expectedAudience"')
+  }
 
   const authorization = request.headers.get('authorization')
   if (authorization === null) {
@@ -6599,6 +6606,170 @@ function reassignRSCode(err: unknown): never {
     err.code = INVALID_RESPONSE
   }
   throw err
+}
+
+/**
+ * A traceable resource identity established by {@link validateResourceIdentity}.
+ *
+ * It records which discovery-provided values the validated JWT Access Token and the incoming
+ * request were bound to, so that the resource server can audit (or base further authorization
+ * decisions on) the exact issuer, audience, and endpoint the token was accepted for.
+ *
+ * @group JWT Access Tokens
+ */
+export interface ResourceIdentity {
+  /**
+   * Authorization server issuer identifier the access token's {@link JWTAccessTokenClaims.iss `iss`}
+   * claim was validated against. It is also confirmed to be one of the resource metadata's
+   * {@link ResourceServer.authorization_servers `authorization_servers`} when that metadata is
+   * present.
+   */
+  readonly issuer: string
+
+  /**
+   * Resource identifier from the validated resource metadata that the access token's
+   * {@link JWTAccessTokenClaims.aud `aud`} claim was matched against.
+   */
+  readonly audience: string
+
+  /**
+   * Normalized URL (query and fragment removed) of the endpoint the access token was presented at.
+   * It is confirmed to be within the scope of the resource identifier recorded as
+   * {@link ResourceIdentity.audience `audience`}.
+   */
+  readonly endpoint: string
+
+  /**
+   * Validated JWT Access Token claims, see {@link validateJwtAccessToken}.
+   */
+  readonly claims: JWTAccessTokenClaims
+}
+
+function assertResourceIdentifier(resource: unknown, it: string): asserts resource is string {
+  assertString(resource, it)
+
+  try {
+    new URL(resource)
+  } catch {
+    throw CodedTypeError(`${it} must be a valid URL`, ERR_INVALID_ARG_VALUE)
+  }
+}
+
+/**
+ * Returns true when the request endpoint is within the scope of the resource identifier, i.e. it
+ * shares its origin and its path is equal to, or a descendant of, the identifier's path.
+ */
+function endpointMatchesResourceIdentifier(identifier: URL, endpoint: URL): boolean {
+  if (identifier.origin !== endpoint.origin) {
+    return false
+  }
+
+  let base = identifier.pathname
+  if (base.length > 1 && base.endsWith('/')) {
+    base = base.slice(0, -1)
+  }
+
+  return base === '/' || endpoint.pathname === base || endpoint.pathname.startsWith(`${base}/`)
+}
+
+/**
+ * Validates a resource request's JWT Access Token and binds it to a traceable
+ * {@link ResourceIdentity} derived from the resource server's discovered metadata.
+ *
+ * In addition to everything {@link validateJwtAccessToken} validates (plain Bearer and DPoP-bound
+ * tokens alike), this ties the discovery-provided issuer, audience, and endpoint to the actual
+ * request being processed, so that a token issued for another resource cannot be replayed here:
+ *
+ * - The request URL must be within the scope of (same origin and path as, or a descendant of) at
+ *   least one of the provided {@link ResourceServer.resource resource identifiers}. Otherwise an
+ *   {@link OperationProcessingError} with the `request URL does not match the resource identifier`
+ *   message is thrown.
+ * - When the resource metadata contains
+ *   {@link ResourceServer.authorization_servers `authorization_servers`}, the Authorization Server's
+ *   issuer must be one of them. Otherwise an {@link OperationProcessingError} with the
+ *   `authorization server issuer is not one of the resource metadata "authorization_servers"`
+ *   message is thrown.
+ * - The JWT Access Token's `aud` claim must contain at least one of the resource identifiers the
+ *   request URL matched. Otherwise an {@link OperationProcessingError} with the `unexpected JWT
+ *   "aud" (audience) claim value` message is thrown.
+ *
+ * @param as Authorization Server to accept JWT Access Tokens from.
+ * @param resource Resource Server Metadata (see {@link processResourceDiscoveryResponse}) describing
+ *   this protected resource. An array may be provided when the resource server is reachable under
+ *   multiple resource identifiers.
+ * @param request Incoming resource request.
+ * @param options See {@link ValidateJWTAccessTokenOptions}.
+ *
+ * @returns Resolves with the {@link ResourceIdentity} the request was bound to.
+ *
+ * @group JWT Access Tokens
+ *
+ * @see [RFC 6750 - OAuth 2.0 Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750.html)
+ * @see [RFC 8707 - Resource Indicators for OAuth 2.0](https://www.rfc-editor.org/rfc/rfc8707.html)
+ * @see [RFC 9068 - JSON Web Token (JWT) Profile for OAuth 2.0 Access Tokens](https://www.rfc-editor.org/rfc/rfc9068.html)
+ * @see [RFC 9728 - OAuth 2.0 Protected Resource Metadata](https://www.rfc-editor.org/rfc/rfc9728.html)
+ */
+export async function validateResourceIdentity(
+  as: AuthorizationServer,
+  resource: ResourceServer | ResourceServer[],
+  request: Request,
+  options?: ValidateJWTAccessTokenOptions,
+): Promise<ResourceIdentity> {
+  assertAs(as)
+
+  const resources = (Array.isArray(resource) ? resource : [resource]) as ResourceServer[]
+  if (resources.length === 0) {
+    throw CodedTypeError('"resource" must not be an empty array', ERR_INVALID_ARG_VALUE)
+  }
+
+  const identifiers = resources.map((metadata, i) => {
+    const it = Array.isArray(resource) ? `resource[${i}]` : 'resource'
+    if (!isJsonObject(metadata)) {
+      throw CodedTypeError(`"${it}" must be an object`, ERR_INVALID_ARG_TYPE)
+    }
+    assertResourceIdentifier(metadata.resource, `"${it}.resource"`)
+    return new URL(metadata.resource)
+  })
+
+  if (!looseInstanceOf(request, Request)) {
+    throw CodedTypeError('"request" must be an instance of Request', ERR_INVALID_ARG_TYPE)
+  }
+
+  const endpoint = new URL(request.url)
+
+  const scoped = resources.filter((_, i) =>
+    endpointMatchesResourceIdentifier(identifiers[i], endpoint),
+  )
+  if (scoped.length === 0) {
+    throw OPE('request URL does not match the resource identifier', INVALID_REQUEST, {
+      expected: resources.map((metadata) => metadata.resource),
+      url: request.url,
+    })
+  }
+
+  const trusted = scoped.filter((metadata) => metadata.authorization_servers !== undefined)
+  if (
+    trusted.length !== 0 &&
+    !trusted.some((metadata) => metadata.authorization_servers!.includes(as.issuer))
+  ) {
+    throw OPE(
+      'authorization server issuer is not one of the resource metadata "authorization_servers"',
+      JSON_ATTRIBUTE_COMPARISON,
+      { expected: as.issuer, body: resource, attribute: 'authorization_servers' },
+    )
+  }
+
+  const expectedAudience = scoped.map((metadata) => metadata.resource)
+  const claims = await validateJwtAccessToken(as, request, expectedAudience, options)
+
+  const claimAudiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud]
+  const audience = expectedAudience.find((aud) => claimAudiences.includes(aud))!
+
+  const normalized = new URL(request.url)
+  normalized.search = ''
+  normalized.hash = ''
+
+  return { issuer: as.issuer, audience, endpoint: normalized.href, claims }
 }
 
 /**

@@ -63,6 +63,7 @@ export const validateCodeIdTokenResponse = defaultCustomFetch(lib.validateCodeId
 export const deviceAuthorizationRequest = defaultCustomFetch(lib.deviceAuthorizationRequest, 4)
 export const deviceCodeGrantRequest = defaultCustomFetch(lib.deviceCodeGrantRequest, 4)
 export const validateJwtAccessToken = defaultCustomFetch(lib.validateJwtAccessToken, 3)
+export const validateResourceIdentity = defaultCustomFetch(lib.validateResourceIdentity, 3)
 export const backchannelAuthenticationRequest = defaultCustomFetch(
   lib.backchannelAuthenticationRequest,
   4,
