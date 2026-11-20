@@ -5595,7 +5595,22 @@ export async function validateCodeIdTokenResponse(
   )
 }
 
-async function consumeStream(request: Request) {
+/**
+ * Maximum size (in bytes) of a `form_post` authorization response body that the client will buffer.
+ * A form_post only carries a handful of short response parameters so anything larger is treated as
+ * a bad stream instead of being read into memory without bounds.
+ */
+const MAX_FORM_POST_BODY_SIZE = 65536
+
+/**
+ * Reads a form_post Request body at most once and within {@link MAX_FORM_POST_BODY_SIZE}.
+ *
+ * The stream is consumed through a single reader. Reading stops as soon as the budget is exceeded
+ * or the stream errors, the reader is cancelled so that no further data is consumed, and the
+ * failure is propagated without ever retrying the body. Callers therefore never see a partially
+ * consumed, reusable stream and bad bodies cannot reach the authorization state.
+ */
+async function consumeStream(request: Request): Promise<string> {
   if (request.bodyUsed) {
     throw CodedTypeError(
       'form_post Request instances must contain a readable body',
@@ -5604,7 +5619,48 @@ async function consumeStream(request: Request) {
     )
   }
 
-  return request.text()
+  const body = request.body
+  if (body === null) {
+    return ''
+  }
+
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+
+      size += value.byteLength
+      if (size > MAX_FORM_POST_BODY_SIZE) {
+        throw OPE(
+          `form_post response body exceeds the maximum allowed size of ${MAX_FORM_POST_BODY_SIZE} bytes`,
+          INVALID_RESPONSE,
+          { cause: request },
+        )
+      }
+
+      chunks.push(value)
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {})
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+
+  let total = 0
+  const bytes = new Uint8Array(size)
+  for (const chunk of chunks) {
+    bytes.set(chunk, total)
+    total += chunk.byteLength
+  }
+
+  return decoder.decode(bytes)
 }
 
 /**
