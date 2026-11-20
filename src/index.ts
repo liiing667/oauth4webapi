@@ -1880,6 +1880,12 @@ function formUrlEncode(token: string) {
 /**
  * A function that applies client authentication to an authorization server request.
  *
+ * The built-in client authentication methods each use exactly one mechanism. Combining a method
+ * with conflicting request parameters (e.g. `client_secret` or `client_assertion` in the request
+ * body) or duplicated client authentication parameters rejects the request before it is sent.
+ * Responses that redirect the authenticated request to a different endpoint are rejected as well so
+ * that the client authentication credentials are never sent to another endpoint.
+ *
  * @see {@link ClientSecretPost}
  * @see {@link ClientSecretBasic}
  * @see {@link PrivateKeyJwt}
@@ -1893,6 +1899,86 @@ export type ClientAuth = (
   body: URLSearchParams,
   headers: Headers,
 ) => void | Promise<void>
+
+const clientAuthenticationMethod = Symbol('clientAuthenticationMethod')
+
+type BrandedClientAuth = ClientAuth & {
+  [clientAuthenticationMethod]: ClientAuthenticationMethod
+}
+
+type ClientAuthenticationMethod =
+  'client_secret_basic' | 'client_secret_post' | 'private_key_jwt' | 'client_secret_jwt' | 'none'
+
+const clientAuthenticationParameters = [
+  'client_id',
+  'client_secret',
+  'client_assertion',
+  'client_assertion_type',
+] as const
+
+function brandClientAuth(method: ClientAuthenticationMethod, clientAuth: ClientAuth): ClientAuth {
+  Object.defineProperty(clientAuth, clientAuthenticationMethod, {
+    value: method,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  })
+  return clientAuth
+}
+
+function getClientAuthenticationMethod(
+  clientAuth: ClientAuth,
+): ClientAuthenticationMethod | undefined {
+  return (clientAuth as Partial<BrandedClientAuth>)[clientAuthenticationMethod]
+}
+
+function assertNoDuplicateParameter(body: URLSearchParams, parameter: string) {
+  if (body.getAll(parameter).length > 1) {
+    throw CodedTypeError(
+      `the "${parameter}" request parameter must not be provided more than once`,
+      ERR_INVALID_ARG_VALUE,
+    )
+  }
+}
+
+function assertNoClientAuthenticationConflicts(clientAuth: ClientAuth, body: URLSearchParams) {
+  for (const parameter of clientAuthenticationParameters) {
+    assertNoDuplicateParameter(body, parameter)
+  }
+
+  const method = getClientAuthenticationMethod(clientAuth)
+  if (method === undefined) {
+    return
+  }
+
+  const conflictingParameters: string[] = []
+  if (body.has('client_secret') && method !== 'client_secret_post') {
+    conflictingParameters.push('client_secret')
+  }
+  if (
+    body.has('client_assertion') &&
+    method !== 'private_key_jwt' &&
+    method !== 'client_secret_jwt'
+  ) {
+    conflictingParameters.push('client_assertion')
+  }
+  if (
+    body.has('client_assertion_type') &&
+    method !== 'private_key_jwt' &&
+    method !== 'client_secret_jwt'
+  ) {
+    conflictingParameters.push('client_assertion_type')
+  }
+
+  if (conflictingParameters.length) {
+    throw CodedTypeError(
+      `"${method}" client authentication cannot be combined with the ${conflictingParameters
+        .map((parameter) => `"${parameter}"`)
+        .join(', ')} request parameter${conflictingParameters.length > 1 ? 's' : ''}`,
+      ERR_INVALID_ARG_VALUE,
+    )
+  }
+}
 
 /**
  * **`client_secret_post`** sends `client_id` and `client_secret` in the form-encoded request body.
@@ -1915,10 +2001,10 @@ export type ClientAuth = (
  */
 export function ClientSecretPost(clientSecret: string): ClientAuth {
   assertString(clientSecret, '"clientSecret"')
-  return (_as, client, body, _headers) => {
+  return brandClientAuth('client_secret_post', (_as, client, body, _headers) => {
     body.set('client_id', client.client_id)
     body.set('client_secret', clientSecret)
-  }
+  })
 }
 
 /**
@@ -1943,12 +2029,12 @@ export function ClientSecretPost(clientSecret: string): ClientAuth {
  */
 export function ClientSecretBasic(clientSecret: string): ClientAuth {
   assertString(clientSecret, '"clientSecret"')
-  return (_as, client, _body, headers) => {
+  return brandClientAuth('client_secret_basic', (_as, client, _body, headers) => {
     const username = formUrlEncode(client.client_id)
     const password = formUrlEncode(clientSecret)
     const credentials = btoa(`${username}:${password}`)
     headers.set('authorization', `Basic ${credentials}`)
-  }
+  })
 }
 
 /**
@@ -2001,7 +2087,7 @@ export function PrivateKeyJwt(
 ): ClientAuth {
   const { key, kid } = getKeyAndKid(clientPrivateKey)
   assertPrivateKey(key, '"clientPrivateKey.key"')
-  return async (as, client, body, _headers) => {
+  return brandClientAuth('private_key_jwt', async (as, client, body, _headers) => {
     const header = { alg: keyToJws(key), kid }
     const payload = clientAssertionPayload(as, client)
 
@@ -2010,7 +2096,7 @@ export function PrivateKeyJwt(
     body.set('client_id', client.client_id)
     body.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer')
     body.set('client_assertion', await signJwt(header, payload, key))
-  }
+  })
 }
 
 /**
@@ -2040,7 +2126,7 @@ export function ClientSecretJwt(
   assertString(clientSecret, '"clientSecret"')
   const modify = options?.[modifyAssertion]
   let key: CryptoKey
-  return async (as, client, body, _headers) => {
+  return brandClientAuth('client_secret_jwt', async (as, client, body, _headers) => {
     key ||= await crypto.subtle.importKey(
       'raw',
       buf(clientSecret) as Uint8Array<ArrayBuffer>,
@@ -2060,7 +2146,7 @@ export function ClientSecretJwt(
     body.set('client_id', client.client_id)
     body.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer')
     body.set('client_assertion', `${data}.${b64u(new Uint8Array(hmac))}`)
-  }
+  })
 }
 
 /**
@@ -2076,9 +2162,9 @@ export function ClientSecretJwt(
  * @see [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0-errata2.html#ClientAuthentication)
  */
 export function None(): ClientAuth {
-  return (_as, client, body, _headers) => {
+  return brandClientAuth('none', (_as, client, body, _headers) => {
     body.set('client_id', client.client_id)
-  }
+  })
 }
 
 /**
@@ -3597,16 +3683,42 @@ async function authenticatedRequest(
   headers: Headers,
   options?: Omit<HttpRequestOptions<'POST', URLSearchParams>, 'headers'>,
 ) {
+  assertNoClientAuthenticationConflicts(clientAuthentication, body)
+
   await clientAuthentication(as, client, body, headers)
   headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8')
 
-  return (options?.[customFetch] || fetch)(url.href, {
+  const response = await (options?.[customFetch] || fetch)(url.href, {
     body,
     headers: Object.fromEntries(headers.entries()),
     method: 'POST',
     redirect: 'manual',
     signal: signal(url, options?.signal),
   })
+
+  assertNoCrossEndpointRedirect(response, url)
+
+  return response
+}
+
+function assertNoCrossEndpointRedirect(response: Response, url: URL) {
+  if (response.status < 300 || response.status > 399) {
+    return
+  }
+
+  const location = response.headers.get('location')
+  let redirect: URL | null = null
+  if (location !== null) {
+    redirect = URLParse(location, url)
+  }
+
+  if (redirect === null || redirect.href !== url.href) {
+    throw OPE(
+      'the authorization server responded with a redirect to a different endpoint, client authentication credentials must not be sent to a different endpoint',
+      RESPONSE_IS_NOT_CONFORM,
+      response,
+    )
+  }
 }
 
 /**

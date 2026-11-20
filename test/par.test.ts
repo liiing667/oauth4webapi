@@ -247,3 +247,30 @@ test('processPushedAuthorizationResponse()', async () => {
     }),
   )
 })
+
+test('pushedAuthorizationRequest() rejects a cross-endpoint redirect', async () => {
+  const tIssuer: lib.AuthorizationServer = {
+    ...issuer,
+    pushed_authorization_request_endpoint: endpoint('par-redirect'),
+  }
+
+  context
+    .intercept({
+      path: '/par-redirect',
+      method: 'POST',
+    })
+    .reply(302, '', {
+      headers: { location: endpoint('par-redirect-target') },
+    })
+
+  const err = await captureRejection(
+    lib.pushedAuthorizationRequest(
+      tIssuer,
+      tClient,
+      lib.ClientSecretBasic('foo'),
+      new URLSearchParams(),
+    ),
+    { name: 'OperationProcessingError', code: lib.RESPONSE_IS_NOT_CONFORM },
+  )
+  assert.match(err.message, /redirect to a different endpoint/)
+})

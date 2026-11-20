@@ -1,5 +1,6 @@
 import test, { before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { captureRejection } from './_errors.js'
 
 import setup, {
   client,
@@ -272,4 +273,159 @@ test('client_secret_jwt', async () => {
     .reply(200, '')
 
   await lib.revocationRequest(tIssuer, client, lib.ClientSecretJwt('client_secret'), 'token')
+})
+
+test('conflicting "authorization" header is rejected before the request', async () => {
+  const tIssuer = {
+    ...issuer,
+    revocation_endpoint: endpoint('test-conflicting-header'),
+  }
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretBasic('foo'), 'token', {
+      headers: { authorization: 'Bearer unrelated' },
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message: '"options.headers" must not include the "authorization" header name',
+    },
+  )
+})
+
+test('conflicting form parameters are rejected before the request', async () => {
+  const tIssuer = {
+    ...issuer,
+    revocation_endpoint: endpoint('test-conflicting-params'),
+  }
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretBasic('foo'), 'token', {
+      additionalParameters: { client_secret: 'bar' },
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message:
+        '"client_secret_basic" client authentication cannot be combined with the "client_secret" request parameter',
+    },
+  )
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.None(), 'token', {
+      additionalParameters: [
+        ['client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'],
+        ['client_assertion', 'eyJhbGciOiJub25lIn0.e30.'],
+      ],
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message:
+        '"none" client authentication cannot be combined with the "client_assertion", "client_assertion_type" request parameters',
+    },
+  )
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretPost('foo'), 'token', {
+      additionalParameters: [['client_assertion', 'eyJhbGciOiJub25lIn0.e30.']],
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message:
+        '"client_secret_post" client authentication cannot be combined with the "client_assertion" request parameter',
+    },
+  )
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretBasic('foo'), 'token', {
+      additionalParameters: [
+        ['client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'],
+        ['client_assertion', 'eyJhbGciOiJub25lIn0.e30.'],
+      ],
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message:
+        '"client_secret_basic" client authentication cannot be combined with the "client_assertion", "client_assertion_type" request parameters',
+    },
+  )
+})
+
+test('duplicated client authentication parameters are rejected before the request', async () => {
+  const tIssuer = {
+    ...issuer,
+    revocation_endpoint: endpoint('test-duplicated-params'),
+  }
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretPost('foo'), 'token', {
+      additionalParameters: [
+        ['client_secret', 'bar'],
+        ['client_secret', 'baz'],
+      ],
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message: 'the "client_secret" request parameter must not be provided more than once',
+    },
+  )
+
+  await assert.rejects(
+    lib.revocationRequest(tIssuer, client, lib.None(), 'token', {
+      additionalParameters: [
+        ['client_id', 'other-client'],
+        ['client_id', 'yet-another-client'],
+      ],
+    }),
+    {
+      name: 'TypeError',
+      code: 'ERR_INVALID_ARG_VALUE',
+      message: 'the "client_id" request parameter must not be provided more than once',
+    },
+  )
+})
+
+test('cross-endpoint redirects are rejected instead of following them', async () => {
+  const tIssuer = {
+    ...issuer,
+    revocation_endpoint: endpoint('test-redirect'),
+  }
+
+  context
+    .intercept({
+      path: '/test-redirect',
+      method: 'POST',
+    })
+    .reply(303, '', {
+      headers: { location: endpoint('somewhere-else') },
+    })
+
+  const error = await captureRejection(
+    lib.revocationRequest(tIssuer, client, lib.ClientSecretBasic('foo'), 'token'),
+    { name: 'OperationProcessingError', code: lib.RESPONSE_IS_NOT_CONFORM },
+  )
+  assert.match(error.message, /redirect to a different endpoint/)
+})
+
+test('a redirect back to the same endpoint is not treated as a cross-endpoint redirect', async () => {
+  const tIssuer = {
+    ...issuer,
+    revocation_endpoint: endpoint('test-same-endpoint-redirect'),
+  }
+
+  context
+    .intercept({
+      path: '/test-same-endpoint-redirect',
+      method: 'POST',
+    })
+    .reply(303, '', {
+      headers: { location: endpoint('test-same-endpoint-redirect') },
+    })
+
+  const response = await lib.revocationRequest(tIssuer, client, lib.None(), 'token')
+  assert.strictEqual(response.status, 303)
 })
