@@ -19,3 +19,12 @@ A JSON Web Key Set cache value suitable for external persistence.
 ### uat
 
 • **uat**: `number`
+
+***
+
+### issuer?
+
+• `optional` **issuer?**: `string`
+
+The [`as.issuer`](AuthorizationServer.md#issuer) value the cached JSON Web Key Set belongs to.
+A cache recorded for another issuer is never used to select JWT verification keys.

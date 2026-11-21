@@ -577,6 +577,12 @@ export const jweDecrypt: unique symbol = Symbol()
  * - Afterwards, update the key-value storage if the {@link ExportedJWKSCache.uat `uat`} property of
  *   the object has changed.
  *
+ * The cache is bound to the authorization server it was recorded for, its
+ * {@link ExportedJWKSCache.issuer `issuer`} property is checked against
+ * {@link AuthorizationServer.issuer `as.issuer`} before the cached JSON Web Key Set is used to
+ * select JWT verification keys. When your client integrates with multiple authorization servers you
+ * must use a distinct cache for each issuer.
+ *
  * @example
  *
  * ```ts
@@ -3216,6 +3222,12 @@ let jwksKeys: WeakMap<JWK, Map<string, Promise<CryptoKey>>>
 export interface ExportedJWKSCache {
   jwks: JWKS
   uat: number
+
+  /**
+   * The {@link AuthorizationServer.issuer `as.issuer`} value the cached JSON Web Key Set belongs to.
+   * A cache recorded for another issuer is never used to select JWT verification keys.
+   */
+  issuer?: string
 }
 
 /**
@@ -3239,12 +3251,17 @@ function setJwksCache(
   })
 
   if (cache) {
-    Object.assign(cache, { jwks: structuredClone(jwks), uat })
+    Object.assign(cache, { jwks: structuredClone(jwks), uat, issuer: as.issuer })
   }
 }
 
-function isFreshJwksCache(input: unknown): input is ExportedJWKSCache {
+function isFreshJwksCache(input: unknown, issuer: string): input is ExportedJWKSCache {
   if (typeof input !== 'object' || input === null) {
+    return false
+  }
+
+  if ('issuer' in input && input.issuer !== issuer) {
+    // a cache recorded for another issuer must not be used
     return false
   }
 
@@ -3268,6 +3285,7 @@ function clearJwksCache(as: AuthorizationServer, cache?: Partial<JWKSCacheInput>
   jwksMap?.delete(as)
   delete cache?.jwks
   delete cache?.uat
+  delete cache?.issuer
 }
 
 async function getPublicSigKeyFromIssuerJwksUri(
@@ -3278,7 +3296,7 @@ async function getPublicSigKeyFromIssuerJwksUri(
   const { alg, kid } = header
   checkSupportedJwsAlg(header)
 
-  if (!jwksMap?.has(as) && isFreshJwksCache(options?.[jwksCache])) {
+  if (!jwksMap?.has(as) && isFreshJwksCache(options?.[jwksCache], as.issuer)) {
     setJwksCache(as, options?.[jwksCache].jwks, options?.[jwksCache].uat)
   }
 

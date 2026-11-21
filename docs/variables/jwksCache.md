@@ -39,6 +39,12 @@ The intended use pattern is:
 - Afterwards, update the key-value storage if the [`uat`](../interfaces/ExportedJWKSCache.md#uat) property of
   the object has changed.
 
+The cache is bound to the authorization server it was recorded for, its
+[`issuer`](../interfaces/ExportedJWKSCache.md#issuer) property is checked against
+[`as.issuer`](../interfaces/AuthorizationServer.md#issuer) before the cached JSON Web Key Set is used to
+select JWT verification keys. When your client integrates with multiple authorization servers you
+must use a distinct cache for each issuer.
+
 ## Example
 
 ```ts
